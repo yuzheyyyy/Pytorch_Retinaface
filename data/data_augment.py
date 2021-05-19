@@ -1,10 +1,14 @@
+from torch.nn.functional import pad
 import cv2
 import numpy as np
 import random
+
+import imgaug as ia
+import imgaug.augmenters as iaa
 from utils.box_utils import matrix_iof
 
 
-def _crop(image, boxes, labels, landm, img_dim):
+def _crop(image, boxes, labels, landm, angles, visible, img_dim):
     height, width, _ = image.shape
     pad_image_flag = True
 
@@ -32,7 +36,7 @@ def _crop(image, boxes, labels, landm, img_dim):
         roi = np.array((l, t, l + w, t + h))
 
         value = matrix_iof(boxes, roi[np.newaxis])
-        flag = (value >= 1)
+        flag = (value >= 1.0)
         if not flag.any():
             continue
 
@@ -42,6 +46,8 @@ def _crop(image, boxes, labels, landm, img_dim):
         labels_t = labels[mask_a].copy()
         landms_t = landm[mask_a].copy()
         landms_t = landms_t.reshape([-1, 5, 2])
+        angles_t = angles[mask_a].copy()
+        visible_t = visible[mask_a].copy()
 
         if boxes_t.shape[0] == 0:
             continue
@@ -52,11 +58,20 @@ def _crop(image, boxes, labels, landm, img_dim):
         boxes_t[:, :2] -= roi[:2]
         boxes_t[:, 2:] = np.minimum(boxes_t[:, 2:], roi[2:])
         boxes_t[:, 2:] -= roi[:2]
-
+        if np.any(boxes_t<0):
+            print('fail')
+        # print('box {}'.format(np.any(boxes_t<0)))
         # landm
+
+        
+        mask1 = np.any(landms_t < roi[:2], axis=-1)# mask for those invisible landmarks, both original (-1,-1) and (landmark < roi)
+        mask2 = np.any(landms_t > roi[2:], axis=-1)
+        mask = np.logical_or(mask1, mask2)
+
         landms_t[:, :, :2] = landms_t[:, :, :2] - roi[:2]
         landms_t[:, :, :2] = np.maximum(landms_t[:, :, :2], np.array([0, 0]))
         landms_t[:, :, :2] = np.minimum(landms_t[:, :, :2], roi[2:] - roi[:2])
+        landms_t[mask] = -1
         landms_t = landms_t.reshape([-1, 10])
 
 
@@ -67,14 +82,18 @@ def _crop(image, boxes, labels, landm, img_dim):
         boxes_t = boxes_t[mask_b]
         labels_t = labels_t[mask_b]
         landms_t = landms_t[mask_b]
+        angles_t = angles_t[mask_b]
+        visible_t = visible_t[mask_b]
 
         if boxes_t.shape[0] == 0:
             continue
 
         pad_image_flag = False
 
-        return image_t, boxes_t, labels_t, landms_t, pad_image_flag
-    return image, boxes, labels, landm, pad_image_flag
+        return image_t, boxes_t, labels_t, landms_t, angles_t, visible_t, pad_image_flag
+    return image, boxes, labels, landm, angles, visible, pad_image_flag
+
+
 
 
 def _distort(image):
@@ -174,7 +193,9 @@ def _mirror(image, boxes, landms):
         # landm
         landms = landms.copy()
         landms = landms.reshape([-1, 5, 2])
+        # mask = np.any(landms < 0, axis=-1)
         landms[:, :, 0] = width - landms[:, :, 0]
+        # landms[mask] = -1
         tmp = landms[:, 1, :].copy()
         landms[:, 1, :] = landms[:, 0, :]
         landms[:, 0, :] = tmp
@@ -203,7 +224,92 @@ def _resize_subtract_mean(image, insize, rgb_mean):
     image = cv2.resize(image, (insize, insize), interpolation=interp_method)
     image = image.astype(np.float32)
     image -= rgb_mean
+    # image /= 128.
     return image.transpose(2, 0, 1)
+
+
+
+class Cutout(object):
+    """Randomly mask out one or more patches from an image.
+    Args:
+        n_holes (int): Number of patches to cut out of each image.
+        length (int): The length (in pixels) of each square patch.
+    """
+    def __init__(self, n_holes, length):
+        self.n_holes = n_holes
+        self.length = length
+
+    def __call__(self, img):
+        """
+        Args:
+            img (Tensor): Tensor image of size (C, H, W).
+        Returns:
+            Tensor: Image with n_holes of dimension length x length cut out of it.
+        """
+        w, h = img.shape[-2:]
+
+        mask = np.ones((h, w), np.float32)
+
+        for n in range(self.n_holes):
+            y = np.random.randint(h)
+            x = np.random.randint(w)
+
+            y1 = np.clip(y - self.length // 2, 0, h)
+            y2 = np.clip(y + self.length // 2, 0, h)
+            x1 = np.clip(x - self.length // 2, 0, w)
+            x2 = np.clip(x + self.length // 2, 0, w)
+
+            mask[y1: y2, x1: x2] = 0.
+
+        mask = mask[np.newaxis, ...].repeat(3, axis=0)
+        img = img * mask
+
+        return img
+
+
+def _transformation(image, boxes, landm):
+    h, w, _ = image.shape
+    num = np.shape(boxes)[0]
+    boxes_all = np.hstack((boxes, boxes[:, [0, 3, 1, 2]]))
+    points_all = np.hstack((boxes_all, landm)).reshape(1, -1, 2)
+
+
+    seq = iaa.Sequential([
+        iaa.Affine(
+            # scale={"x": (0.8, 1.2), "y": (0.8, 1.2)}, # scale images to 80-120% of their size, individually per axis
+            # translate_percent={"x": (-0.2, 0.2), "y": (-0.2, 0.2)}, # translate by -20 to +20 percent (per axis)
+            rotate=(-25, 25), # rotate by -45 to +45 degrees
+            shear=(-16, 16), # shear by -16 to +16 degrees
+            order=[0, 1], # use nearest neighbour or bilinear interpolation (fast)
+            # cval=(0, 255), # if mode is constant, use a cval between 0 and 255
+            mode= "constant" # use any of scikit-image's warping modes (see 2nd image from the top for examples)
+        ), 
+        iaa.PerspectiveTransform(scale=(0.1, 0.15), keep_size=True)])
+    
+    img_aug, points_aug = seq(image=image, keypoints=points_all)
+    points_aug = points_aug.reshape([-1, 2])
+    for i in range(num):
+
+        # box
+        box1 = np.min(points_aug[9*i:9*i+4, :], axis=0).reshape(2)
+        mask1 = (box1 < 0.)
+        box1[mask1] = 0.
+        box2 = np.max(points_aug[9*i:9*i+4, :], axis=0).reshape(2)
+        mask2 = (box2 > np.array([w, h]))
+        box2[mask2] = np.array([w, h])[mask2]
+        boxes[i, :2] = box1
+        boxes[i, 2:] = box2
+
+        # landmarks
+        lm = points_aug[9*i+4:9*(i+1), :]
+        mask1 = np.any(lm < 0, axis=1)
+        mask2 = np.any(lm > np.array([w, h]), axis=1)
+        mask = np.logical_or(mask1, mask2)
+        lm[mask] = -1
+        lm = lm.reshape(10)
+        landm[i, :] = lm
+    
+    return img_aug, boxes, landm
 
 
 class preproc(object):
@@ -212,26 +318,45 @@ class preproc(object):
         self.img_dim = img_dim
         self.rgb_means = rgb_means
 
-    def __call__(self, image, targets):
+    def __call__(self, image, targets, own):
         assert targets.shape[0] > 0, "this image does not have gt"
 
+        '''
+        for label with visible
+        '''
         boxes = targets[:, :4].copy()
-        labels = targets[:, -1].copy()
-        landm = targets[:, 4:-1].copy()
+        labels = targets[:, -7].copy()
+        landm = targets[:, 4:-7].copy()
+        angle = targets[:, -6].copy()
+        visible = targets[:, -5:].copy()
 
-        image_t, boxes_t, labels_t, landm_t, pad_image_flag = _crop(image, boxes, labels, landm, self.img_dim)
+
+        # with visible
+        image_t, boxes_t, labels_t, landm_t, angles_t, visible_t, pad_image_flag = _crop(image, boxes, labels, landm, angle, visible, self.img_dim)
+
         image_t = _distort(image_t)
         image_t = _pad_to_square(image_t,self.rgb_means, pad_image_flag)
-        image_t, boxes_t, landm_t = _mirror(image_t, boxes_t, landm_t)
+
+        image_t, boxes_t, landm_t = _mirror(image_t, boxes_t, landm_t)      
         height, width, _ = image_t.shape
+        # print('self rgb {}'.format(self.rgb_means))
         image_t = _resize_subtract_mean(image_t, self.img_dim, self.rgb_means)
+        if own[:4] == '/opt':
+            rand = np.random.rand()
+            if rand < 0.5:
+                cutout = Cutout(n_holes=2, length=40)
+                image_t = cutout(image_t)
         boxes_t[:, 0::2] /= width
         boxes_t[:, 1::2] /= height
-
         landm_t[:, 0::2] /= width
         landm_t[:, 1::2] /= height
 
+    
         labels_t = np.expand_dims(labels_t, 1)
-        targets_t = np.hstack((boxes_t, landm_t, labels_t))
+
+        '''visible'''
+        angles_t = np.expand_dims(angles_t, 1)
+
+        targets_t = np.hstack((boxes_t, landm_t, labels_t, angles_t, visible_t))
 
         return image_t, targets_t

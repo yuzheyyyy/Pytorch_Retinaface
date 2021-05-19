@@ -92,8 +92,7 @@ def matrix_iof(a, b):
     area_a = np.prod(a[:, 2:] - a[:, :2], axis=1)
     return area_i / np.maximum(area_a[:, np.newaxis], 1)
 
-
-def match(threshold, truths, priors, variances, labels, landms, loc_t, conf_t, landm_t, idx):
+def match(threshold, truths, priors, variances, labels, landms, loc_t, conf_t, landm_t, idx, angle, angle_t, visible, visible_t):
     """Match each prior box with the ground truth box of the highest jaccard
     overlap, encode the bounding boxes, then return the matched indices
     corresponding to both confidence and location preds.
@@ -146,11 +145,39 @@ def match(threshold, truths, priors, variances, labels, landms, loc_t, conf_t, l
     conf[best_truth_overlap < threshold] = 0    # label as background   overlap<0.35的全部作为负样本
     loc = encode(matches, priors, variances)
 
+    ang = angle[best_truth_idx]
+    vis = visible[best_truth_idx]
+
+    # print('best_truth_idx {} lm {}'.format(best_truth_idx.shape, landms.shape))
+    
     matches_landm = landms[best_truth_idx]
+    # print('landm {} match {}'.format(landms.shape, matches_landm.shape))
+
+    # mask1 = (matches_landm < 0)
+    # mask2 = (matches_landm > -1)
+    # mask3 = torch.logical_and(mask1, mask2)
+    # if len(matches_landm[mask3]):
+    #     print('mask1 {}'.format(matches_landm[mask3]))
+
+
+    # mask = (matches_landm == -1)
     landm = encode_landm(matches_landm, priors, variances)
+    # landm[mask] = -1
+
+
+    # mask1 = (landm < 0)
+    # mask2 = (landm > -1)
+    # mask3 = torch.logical_and(mask1, mask2)
+    # if len(landm[mask3]):
+    #     print('mask1 {}'.format(landm[mask3]))
+
     loc_t[idx] = loc    # [num_priors,4] encoded offsets to learn
     conf_t[idx] = conf  # [num_priors] top class label for each prior
     landm_t[idx] = landm
+    angle_t[idx] = ang
+    visible_t[idx] = vis
+
+
 
 
 def encode(matched, priors, variances):
@@ -326,5 +353,3 @@ def nms(boxes, scores, overlap=0.5, top_k=200):
         # keep only elements with an IoU <= overlap
         idx = idx[IoU.le(overlap)]
     return keep, count
-
-
